@@ -1,0 +1,12 @@
+# Generated build artifacts
+/target/
+
+# Runtime data
+/data/
+
+# Local environment files
+.env
+.env.*
+
+# macOS
+.DS_Store
