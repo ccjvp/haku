@@ -2,8 +2,10 @@ use crate::args::Args;
 use hyper::body::HttpBody;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::{path::PathBuf, time::Instant};
+use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 // https://codepointer.dev/p/uv-oncemap-rust-pattern-for-running
@@ -29,7 +31,6 @@ pub struct IO {
     http_client: Client,
     http_limit: Arc<tokio::sync::Semaphore>,
     http_runtime: Option<tokio::runtime::Runtime>,
-    wal_dir: PathBuf,
 }
 
 impl IO {
@@ -70,7 +71,6 @@ impl IO {
             http_client,
             http_limit: Arc::new(tokio::sync::Semaphore::new(args.max_http_requests)),
             http_runtime: Some(http_runtime),
-            wal_dir: args.wal_dir.clone(),
         }
     }
 
@@ -193,7 +193,7 @@ impl IO {
         start: usize,
         limit: Option<usize>,
     ) -> anyhow::Result<()> {
-        let mut file = tokio::fs::File::open(path).await?;
+        let mut file = fs::File::open(path).await?;
         let starts_after_beginning = start != 0;
         if starts_after_beginning {
             file.seek(tokio::io::SeekFrom::Start(start as u64)).await?;
@@ -209,10 +209,12 @@ impl IO {
                     self.recycle_buffer(bytes);
                     return Err(error.into());
                 }
+
                 if bytes.len() != limit {
                     self.recycle_buffer(bytes);
                     return Err(anyhow::anyhow!("range exceeds file length"));
                 }
+
                 Ok(())
             }
             None => file.read_to_end(&mut bytes).await.map(|_| ()),
@@ -232,7 +234,7 @@ impl IO {
         }
 
         let path = self.cache_path(id);
-        if !tokio::fs::try_exists(&path).await? {
+        if !fs::try_exists(&path).await? {
             return Ok(false);
         }
 
@@ -425,8 +427,8 @@ impl IO {
     }
 
     async fn write_file_cache(&self, id: u64, b: &[u8]) -> anyhow::Result<()> {
-        tokio::fs::create_dir_all(&self.cache_dir).await?;
-        tokio::fs::write(self.cache_path(id), b).await?;
+        fs::create_dir_all(&self.cache_dir).await?;
+        fs::write(self.cache_path(id), b).await?;
 
         Ok(())
     }
@@ -489,15 +491,11 @@ impl IO {
         self.cache_dir.join(format!("{id:016x}"))
     }
 
-    fn wal_path(&self, s: &str) -> PathBuf {
-        self.wal_dir.join(s)
-    }
-
-    pub async fn write(&self, name: &str, b: &[u8]) -> anyhow::Result<()> {
-        if is_http(name) {
+    pub async fn write(&self, path: &str, b: &[u8]) -> anyhow::Result<()> {
+        if is_http(path) {
             let client = self.http_client.clone();
             let http_limit = self.http_limit.clone();
-            let url = name.parse::<hyper::Uri>()?;
+            let url = path.parse::<hyper::Uri>()?;
             let body = b.to_vec();
 
             self.http_runtime
@@ -521,8 +519,11 @@ impl IO {
 
             Ok(())
         } else {
-            tokio::fs::create_dir_all(&self.wal_dir).await?;
-            tokio::fs::write(self.wal_path(name), b).await?;
+            if let Some(parent) = Path::new(path).parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(path, b).await?;
+
             Ok(())
         }
     }

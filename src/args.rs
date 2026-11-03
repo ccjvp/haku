@@ -1,6 +1,5 @@
-use std::path::PathBuf;
-
 use clap::Parser;
+use std::path::PathBuf;
 
 fn positive_usize(value: &str) -> Result<usize, String> {
     let value = value
@@ -12,11 +11,15 @@ fn positive_usize(value: &str) -> Result<usize, String> {
     Ok(value)
 }
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(about)]
 pub struct Args {
     #[arg(long)]
     pub no_cache: bool,
+    #[arg(long, default_value = "data/bm25")]
+    pub bm25_path: PathBuf,
+    #[arg(long, default_value = "data")]
+    pub data_dir: PathBuf,
     #[arg(long, default_value = "data/wal")]
     pub wal_dir: PathBuf,
     #[arg(long, default_value = "data/cache")]
