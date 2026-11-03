@@ -1157,7 +1157,8 @@ impl BM25 {
         Ok((updated_ref, child_ref))
     }
 
-    async fn add_doc(&self, doc: &str) -> Result<()> {
+    pub async fn add(&self, doc: &str) -> Result<()> {
+        let started_at = std::time::Instant::now();
         let doc_id = self.get_doc_id();
         let tokens = tokenize(doc);
 
@@ -1266,6 +1267,9 @@ impl BM25 {
             self.to_remove.lock().await.push(old_root);
         }
 
+        let elapsed_ms = started_at.elapsed().as_millis();
+        tracing::info!(elapsed_ms, "Doc indexed");
+
         Ok(())
     }
 
@@ -1300,6 +1304,11 @@ impl BM25 {
         }
 
         let mut to_remove = self.to_remove.lock().await;
+        if to_remove.is_empty() {
+            return Ok(());
+        }
+
+        let started_at = std::time::Instant::now();
         while let Some(&node_ref) = to_remove.last() {
             match node_ref.kind {
                 NodeKind::Node4 => self.node4.write().await.remove(node_ref)?,
@@ -1313,6 +1322,9 @@ impl BM25 {
 
             to_remove.pop();
         }
+
+        let elapsed_ms = started_at.elapsed().as_millis();
+        tracing::info!(elapsed_ms, "Nodes removed");
 
         Ok(())
     }
@@ -1329,7 +1341,8 @@ impl BM25 {
 
             let bytes = fs::read(&source).await?;
             let doc = std::str::from_utf8(&bytes)?;
-            self.add_doc(doc).await?;
+
+            self.add(doc).await?;
             self.remove_nodes().await?;
 
             let dest = args.data_dir.join(entry.file_name());
@@ -1338,6 +1351,7 @@ impl BM25 {
         }
 
         self.remove_nodes().await?;
+
         Ok(())
     }
 }

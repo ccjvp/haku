@@ -1,12 +1,10 @@
-use crate::{args::Args, bm25::BM25, io::IO, server::serve};
+use crate::server::serve;
+use haku::{Args, BM25, IO};
 use clap::Parser;
 use std::sync::Arc;
+use tracing_subscriber::EnvFilter;
 
-mod args;
-mod bm25;
-mod io;
 mod server;
-mod tokenizer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,9 +20,12 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn setup_tracing() {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    let filter = match EnvFilter::try_from_default_env() {
+        Ok(filter) => filter,
+        Err(_) => EnvFilter::new("info"),
+    };
+
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 fn run_index_update(args: Arc<Args>, bm25: Arc<BM25>) {
