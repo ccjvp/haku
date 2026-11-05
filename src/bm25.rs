@@ -1,4 +1,4 @@
-use crate::{args::Args, io::IO, tokenizer::tokenize};
+use crate::{args::Args, bitmap::Bitmap, io::IO, tokenizer::tokenize};
 use anyhow::{Result, ensure};
 use bytemuck::{CheckedBitPattern, NoUninit, bytes_of, checked::try_pod_read_unaligned};
 use std::{
@@ -370,21 +370,20 @@ enum BufState {
 }
 
 #[repr(C)]
-struct Buf<T: Copy, const N: usize, const P: usize> {
+struct Buf<T: Copy, const N: usize, const B: usize> {
     slots: [T; N],
-    // TODO: Bitset
-    free: [bool; N],
+    free: Bitmap<B>,
     state: BufState,
-    padding: [u8; P],
 }
 
-impl<T: Copy + Default, const N: usize, const P: usize> Buf<T, N, P> {
+impl<T: Copy + Default, const N: usize, const B: usize> Buf<T, N, B> {
     fn new() -> Self {
+        assert!(N.div_ceil(64) == B);
+
         Self {
             state: BufState::OnDisk,
             slots: [T::default(); N],
-            free: [true; N],
-            padding: [0; P],
+            free: Bitmap::new(true, N),
         }
     }
 
@@ -393,15 +392,17 @@ impl<T: Copy + Default, const N: usize, const P: usize> Buf<T, N, P> {
     }
 }
 
-struct Allocator<T: Copy, const N: usize, const P: usize> {
-    bufs: HashMap<u32, Buf<T, N, P>>,
+struct Allocator<T: Copy, const N: usize, const B: usize> {
+    bufs: HashMap<u32, Buf<T, N, B>>,
+    free: Vec<u32>,
     kind: NodeKind,
 }
 
-impl<T: Copy + Default, const N: usize, const P: usize> Allocator<T, N, P> {
+impl<T: Copy + Default, const N: usize, const B: usize> Allocator<T, N, B> {
     fn new(kind: NodeKind) -> Self {
         Self {
             bufs: HashMap::new(),
+            free: vec![],
             kind,
         }
     }
@@ -426,7 +427,7 @@ impl<T: Copy + Default, const N: usize, const P: usize> Allocator<T, N, P> {
         let buf = self.bufs.get_mut(&node_ref.buf_id).unwrap();
         let slot = node_ref.slot as usize;
 
-        ensure!(!buf.free[slot]);
+        ensure!(!buf.free.get(slot));
 
         buf.slots[slot] = node;
         buf.state = BufState::Dirty;
@@ -435,22 +436,41 @@ impl<T: Copy + Default, const N: usize, const P: usize> Allocator<T, N, P> {
 
     fn remove(&mut self, node_ref: NodeRef) -> Result<()> {
         ensure!(node_ref.kind == self.kind);
+
         let buf = self.bufs.get_mut(&node_ref.buf_id).unwrap();
         let slot = node_ref.slot as usize;
-        ensure!(!buf.free[slot]);
+
+        ensure!(!buf.free.get(slot));
+
+        let was_full = buf.free.words.iter().all(|&word| word == 0);
+
         buf.slots[slot] = T::default();
-        buf.free[slot] = true;
+        buf.free.set(slot, true);
         buf.state = BufState::Dirty;
+
+        if was_full {
+            self.free.push(node_ref.buf_id);
+        }
+
         Ok(())
     }
 
     fn add(&mut self, node: T, bm25: &BM25) -> Result<NodeRef> {
         let mut slot = None;
-        'find_slot: for (&id, buf) in &self.bufs {
-            for i in 0..buf.free.len() {
-                if buf.free[i] {
-                    slot = Some((id, i));
-                    break 'find_slot;
+
+        if let Some(buf_id) = self.free.pop() {
+            if let Some(buf) = self.bufs.get(&buf_id) {
+                for (i, w) in buf.free.words.iter().enumerate() {
+                    if *w == 0 {
+                        continue;
+                    }
+
+                    let j = i * 64 + w.trailing_zeros() as usize;
+
+                    if buf.free.get(j) {
+                        slot = Some((buf_id, j));
+                        break;
+                    }
                 }
             }
         }
@@ -465,9 +485,14 @@ impl<T: Copy + Default, const N: usize, const P: usize> Allocator<T, N, P> {
             None => unreachable!(),
         };
 
-        buf.slots[slot] = node;
-        buf.free[slot] = false;
         buf.state = BufState::Dirty;
+        buf.slots[slot] = node;
+        buf.free.set(slot, false);
+
+        // TODO: Cache if the birmap has space?
+        if buf.free.words.iter().any(|&word| word != 0) {
+            self.free.push(buf_id);
+        }
 
         Ok(NodeRef::new(self.kind, buf_id, slot as u16))
     }
@@ -502,12 +527,12 @@ pub struct BM25 {
     active_readers: AtomicUsize,
     buf_id: AtomicU32,
     doc_id: AtomicU64,
-    node4: RwLock<Allocator<Node4, 4946, 5>>,
-    node16: RwLock<Allocator<Node16, 1628, 35>>,
-    node48: RwLock<Allocator<Node48, 399, 0>>,
-    node256: RwLock<Allocator<Node256, 112, 2191>>,
-    terms: RwLock<Allocator<TermLeaf, 63, 4032>>,
-    scalars: RwLock<Allocator<ScalarLeaf, 52428, 3>>,
+    node4: RwLock<Allocator<Node4, 4946, 78>>,
+    node16: RwLock<Allocator<Node16, 1600, 25>>,
+    node48: RwLock<Allocator<Node48, 384, 6>>,
+    node256: RwLock<Allocator<Node256, 112, 2>>,
+    terms: RwLock<Allocator<TermLeaf, 48, 1>>,
+    scalars: RwLock<Allocator<ScalarLeaf, 52416, 819>>,
 }
 
 impl BM25 {

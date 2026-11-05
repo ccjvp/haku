@@ -1,4 +1,5 @@
 mod args;
+mod bitmap;
 mod bm25;
 mod io;
 mod tokenizer;
