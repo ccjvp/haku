@@ -1,6 +1,7 @@
 use crate::{args::Args, bitmap::Bitmap, io::IO, tokenizer::tokenize};
 use anyhow::{Result, ensure};
 use bytemuck::{CheckedBitPattern, NoUninit, bytes_of, checked::try_pod_read_unaligned};
+use parking_lot::RwLock;
 use std::{
     cmp::Ordering,
     collections::HashMap,
@@ -9,10 +10,7 @@ use std::{
         atomic::{AtomicU32, AtomicU64, AtomicUsize},
     },
 };
-use tokio::{
-    fs,
-    sync::{Mutex, RwLock},
-};
+use tokio::{fs, sync::Mutex};
 
 #[derive(Clone, Copy, Default)]
 struct ScalarLeaf {
@@ -430,8 +428,12 @@ impl<T: Copy + Default, const N: usize, const B: usize> Buf<T, N, B> {
         }
     }
 
-    fn get(&self, slot: u16) -> T {
-        self.slots[slot as usize]
+    fn get(&self, slot: u16) -> &T {
+        &self.slots[slot as usize]
+    }
+
+    fn get_mut(&mut self, slot: u16) -> &mut T {
+        &mut self.slots[slot as usize]
     }
 }
 
@@ -451,9 +453,17 @@ impl<T: Copy + Default, const N: usize, const B: usize> Allocator<T, N, B> {
     }
 
     // TODO: Make this return a reference?
-    fn get(&self, node_ref: NodeRef) -> Result<T> {
+    fn get(&self, node_ref: NodeRef) -> Result<&T> {
         let buf = self.bufs.get(&node_ref.buf_id);
         Ok(buf.unwrap().get(node_ref.slot))
+    }
+
+    fn get_mut(&mut self, node_ref: NodeRef) -> Result<&mut T> {
+        ensure!(node_ref.kind == self.kind);
+        let buf = self.bufs.get_mut(&node_ref.buf_id).unwrap();
+        ensure!(!buf.free.get(node_ref.slot as usize));
+        buf.state = BufState::Dirty;
+        Ok(buf.get_mut(node_ref.slot))
     }
 
     fn allocate(&mut self, bm25: &BM25) -> Result<u32> {
@@ -465,7 +475,7 @@ impl<T: Copy + Default, const N: usize, const B: usize> Allocator<T, N, B> {
         Ok(buf_id)
     }
 
-    fn update(&mut self, node_ref: NodeRef, node: T) -> Result<NodeRef> {
+    fn update(&mut self, node_ref: NodeRef, node: &T) -> Result<NodeRef> {
         ensure!(node_ref.kind == self.kind);
 
         let buf = self.bufs.get_mut(&node_ref.buf_id).unwrap();
@@ -473,7 +483,7 @@ impl<T: Copy + Default, const N: usize, const B: usize> Allocator<T, N, B> {
 
         ensure!(!buf.free.get(slot));
 
-        buf.slots[slot] = node;
+        buf.slots[slot] = *node;
         buf.state = BufState::Dirty;
         Ok(node_ref)
     }
@@ -599,7 +609,7 @@ impl BM25 {
             node256: RwLock::new(Allocator::new(NodeKind::Node256)),
         };
 
-        let term_root = bm25.terms.write().await.add(TermLeaf::default(), &bm25)?;
+        let term_root = bm25.terms.write().add(TermLeaf::default(), &bm25)?;
         let doc_root = NodeRef::default();
 
         let header: Header = match handle {
@@ -636,19 +646,23 @@ impl BM25 {
     async fn get_prefix(&self, node_ref: NodeRef) -> Result<([u8; 7], usize)> {
         match node_ref.kind {
             NodeKind::Node4 => {
-                let node = self.node4.read().await.get(node_ref)?;
+                let n4 = self.node4.read();
+                let node = n4.get(node_ref)?;
                 Ok((node.prefix, node.prefix_len as usize))
             }
             NodeKind::Node16 => {
-                let node = self.node16.read().await.get(node_ref)?;
+                let nodes = self.node16.read();
+                let node = nodes.get(node_ref)?;
                 Ok((node.prefix, node.prefix_len as usize))
             }
             NodeKind::Node48 => {
-                let node = self.node48.read().await.get(node_ref)?;
+                let nodes = self.node48.read();
+                let node = nodes.get(node_ref)?;
                 Ok((node.prefix, node.prefix_len as usize))
             }
             NodeKind::Node256 => {
-                let node = self.node256.read().await.get(node_ref)?;
+                let nodes = self.node256.read();
+                let node = nodes.get(node_ref)?;
                 Ok((node.prefix, node.prefix_len as usize))
             }
             NodeKind::Empty | NodeKind::TermLeaf | NodeKind::ScalarLeaf => {
@@ -666,37 +680,35 @@ impl BM25 {
 
         match node_ref.kind {
             NodeKind::Node4 => {
-                let mut nodes = self.node4.write().await;
-                let mut node = nodes.get(node_ref)?;
+                let mut nodes = self.node4.write();
+                let node = nodes.get_mut(node_ref)?;
                 node.prefix = padded_prefix;
                 node.prefix_len = prefix.len() as u8;
-                nodes.update(node_ref, node).map(|_| ())
             }
             NodeKind::Node16 => {
-                let mut nodes = self.node16.write().await;
-                let mut node = nodes.get(node_ref)?;
+                let mut nodes = self.node16.write();
+                let node = nodes.get_mut(node_ref)?;
                 node.prefix = padded_prefix;
                 node.prefix_len = prefix.len() as u8;
-                nodes.update(node_ref, node).map(|_| ())
             }
             NodeKind::Node48 => {
-                let mut nodes = self.node48.write().await;
-                let mut node = nodes.get(node_ref)?;
+                let mut nodes = self.node48.write();
+                let node = nodes.get_mut(node_ref)?;
                 node.prefix = padded_prefix;
                 node.prefix_len = prefix.len() as u8;
-                nodes.update(node_ref, node).map(|_| ())
             }
             NodeKind::Node256 => {
-                let mut nodes = self.node256.write().await;
-                let mut node = nodes.get(node_ref)?;
+                let mut nodes = self.node256.write();
+                let node = nodes.get_mut(node_ref)?;
                 node.prefix = padded_prefix;
                 node.prefix_len = prefix.len() as u8;
-                nodes.update(node_ref, node).map(|_| ())
             }
             NodeKind::Empty | NodeKind::TermLeaf | NodeKind::ScalarLeaf => {
                 anyhow::bail!("cannot set a prefix on a non-internal node")
             }
         }
+
+        Ok(())
     }
 
     async fn copy_with_prefix(&self, node_ref: NodeRef, prefix: &[u8]) -> Result<NodeRef> {
@@ -704,32 +716,48 @@ impl BM25 {
 
         match node_ref.kind {
             NodeKind::Node4 => {
-                let mut node = self.node4.read().await.get(node_ref)?;
+                let mut node = {
+                    let n4 = self.node4.read();
+                    n4.get(node_ref)?.clone()
+                };
+
                 node.prefix = [0; 7];
                 node.prefix[..prefix.len()].copy_from_slice(prefix);
                 node.prefix_len = prefix.len() as u8;
-                Ok(self.node4.write().await.add(node, self)?)
+                Ok(self.node4.write().add(node, self)?)
             }
             NodeKind::Node16 => {
-                let mut node = self.node16.read().await.get(node_ref)?;
+                let mut node = {
+                    let n16 = self.node16.read();
+                    n16.get(node_ref)?.clone()
+                };
+
                 node.prefix = [0; 7];
                 node.prefix[..prefix.len()].copy_from_slice(prefix);
                 node.prefix_len = prefix.len() as u8;
-                Ok(self.node16.write().await.add(node, self)?)
+                Ok(self.node16.write().add(node, self)?)
             }
             NodeKind::Node48 => {
-                let mut node = self.node48.read().await.get(node_ref)?;
+                let mut node = {
+                    let n48 = self.node48.read();
+                    n48.get(node_ref)?.clone()
+                };
+
                 node.prefix = [0; 7];
                 node.prefix[..prefix.len()].copy_from_slice(prefix);
                 node.prefix_len = prefix.len() as u8;
-                Ok(self.node48.write().await.add(node, self)?)
+                Ok(self.node48.write().add(node, self)?)
             }
             NodeKind::Node256 => {
-                let mut node = self.node256.read().await.get(node_ref)?;
+                let mut node = {
+                    let n256 = self.node256.read();
+                    n256.get(node_ref)?.clone()
+                };
+
                 node.prefix = [0; 7];
                 node.prefix[..prefix.len()].copy_from_slice(prefix);
                 node.prefix_len = prefix.len() as u8;
-                Ok(self.node256.write().await.add(node, self)?)
+                Ok(self.node256.write().add(node, self)?)
             }
             NodeKind::Empty | NodeKind::TermLeaf | NodeKind::ScalarLeaf => {
                 anyhow::bail!("cannot copy a prefix onto a non-internal node")
@@ -747,7 +775,7 @@ impl BM25 {
         split_at: usize,
     ) -> Result<(NodeRef, NodeRef)> {
         let new_ref = {
-            let mut n4 = self.node4.write().await;
+            let mut n4 = self.node4.write();
             let range = byte_pos + split_at + 1..bytes.len() - 1;
             n4.add(Node4::with_prefix(&bytes[range]), self)?
         };
@@ -757,17 +785,15 @@ impl BM25 {
             .await?;
 
         let mut branch_ref = {
-            let mut n4 = self.node4.write().await;
+            let mut n4 = self.node4.write();
             n4.add(Node4::with_prefix(&prefix[..split_at]), self)?
         };
 
-        branch_ref = self
-            .insert_child(Edge::new(branch_ref, prefix[split_at]), bottom_ref)
-            .await?;
+        let to_bottom = Edge::new(branch_ref, prefix[split_at]);
+        branch_ref = self.insert_child(to_bottom, bottom_ref).await?;
 
-        branch_ref = self
-            .insert_child(Edge::new(branch_ref, bytes[byte_pos + split_at]), new_ref)
-            .await?;
+        let to_new = Edge::new(branch_ref, bytes[byte_pos + split_at]);
+        branch_ref = self.insert_child(to_new, new_ref).await?;
 
         Ok((branch_ref, new_ref))
     }
@@ -775,19 +801,23 @@ impl BM25 {
     async fn get_postings(&self, node_ref: NodeRef) -> anyhow::Result<(NodeRef, u32)> {
         match node_ref.kind {
             NodeKind::Node4 => {
-                let node = self.node4.read().await.get(node_ref)?;
+                let nodes = self.node4.read();
+                let node = nodes.get(node_ref)?;
                 Ok((node.postings, node.doc_count))
             }
             NodeKind::Node16 => {
-                let node = self.node16.read().await.get(node_ref)?;
+                let nodes = self.node16.read();
+                let node = nodes.get(node_ref)?;
                 Ok((node.postings, node.doc_count))
             }
             NodeKind::Node48 => {
-                let node = self.node48.read().await.get(node_ref)?;
+                let nodes = self.node48.read();
+                let node = nodes.get(node_ref)?;
                 Ok((node.postings, node.doc_count))
             }
             NodeKind::Node256 => {
-                let node = self.node256.read().await.get(node_ref)?;
+                let nodes = self.node256.read();
+                let node = nodes.get(node_ref)?;
                 Ok((node.postings, node.doc_count))
             }
             NodeKind::Empty | NodeKind::TermLeaf | NodeKind::ScalarLeaf => {
@@ -804,32 +834,32 @@ impl BM25 {
     ) -> anyhow::Result<()> {
         match node_ref.kind {
             NodeKind::Node4 => {
-                let mut node4 = self.node4.write().await;
-                let mut node = node4.get(node_ref)?;
+                let mut node4 = self.node4.write();
+                let node = node4.get_mut(node_ref)?;
                 node.postings = postings;
                 node.doc_count = doc_count;
-                node4.update(node_ref, node).map(|_| ())
+                Ok(())
             }
             NodeKind::Node16 => {
-                let mut node16 = self.node16.write().await;
-                let mut node = node16.get(node_ref)?;
+                let mut node16 = self.node16.write();
+                let node = node16.get_mut(node_ref)?;
                 node.postings = postings;
                 node.doc_count = doc_count;
-                node16.update(node_ref, node).map(|_| ())
+                Ok(())
             }
             NodeKind::Node48 => {
-                let mut node48 = self.node48.write().await;
-                let mut node = node48.get(node_ref)?;
+                let mut node48 = self.node48.write();
+                let node = node48.get_mut(node_ref)?;
                 node.postings = postings;
                 node.doc_count = doc_count;
-                node48.update(node_ref, node).map(|_| ())
+                Ok(())
             }
             NodeKind::Node256 => {
-                let mut node256 = self.node256.write().await;
-                let mut node = node256.get(node_ref)?;
+                let mut node256 = self.node256.write();
+                let node = node256.get_mut(node_ref)?;
                 node.postings = postings;
                 node.doc_count = doc_count;
-                node256.update(node_ref, node).map(|_| ())
+                Ok(())
             }
             NodeKind::Empty | NodeKind::TermLeaf | NodeKind::ScalarLeaf => {
                 unreachable!()
@@ -842,19 +872,23 @@ impl BM25 {
 
         match node_ref.kind {
             NodeKind::Node4 => {
-                let node = self.node4.read().await.get(node_ref)?;
+                let nodes = self.node4.read();
+                let node = nodes.get(node_ref)?;
                 Ok(node.child_for(key))
             }
             NodeKind::Node16 => {
-                let node = self.node16.read().await.get(node_ref)?;
+                let nodes = self.node16.read();
+                let node = nodes.get(node_ref)?;
                 Ok(node.child_for(key))
             }
             NodeKind::Node48 => {
-                let node = self.node48.read().await.get(node_ref)?;
+                let nodes = self.node48.read();
+                let node = nodes.get(node_ref)?;
                 Ok(node.child_for(key))
             }
             NodeKind::Node256 => {
-                let node = self.node256.read().await.get(node_ref)?;
+                let nodes = self.node256.read();
+                let node = nodes.get(node_ref)?;
                 Ok(node.child_for(key))
             }
             _ => unreachable!(),
@@ -866,28 +900,28 @@ impl BM25 {
 
         match node_ref.kind {
             NodeKind::Node4 => {
-                let mut node4 = self.node4.write().await;
-                let mut node = node4.get(node_ref)?;
+                let mut node4 = self.node4.write();
+                let node = node4.get_mut(node_ref)?;
                 node.insert_child(key, child_ref)?;
-                node4.update(node_ref, node).map(|_| ())
+                Ok(())
             }
             NodeKind::Node16 => {
-                let mut node16 = self.node16.write().await;
-                let mut node = node16.get(node_ref)?;
+                let mut node16 = self.node16.write();
+                let node = node16.get_mut(node_ref)?;
                 node.insert_child(key, child_ref)?;
-                node16.update(node_ref, node).map(|_| ())
+                Ok(())
             }
             NodeKind::Node48 => {
-                let mut node48 = self.node48.write().await;
-                let mut node = node48.get(node_ref)?;
+                let mut node48 = self.node48.write();
+                let node = node48.get_mut(node_ref)?;
                 node.insert_child(key, child_ref)?;
-                node48.update(node_ref, node).map(|_| ())
+                Ok(())
             }
             NodeKind::Node256 => {
-                let mut node256 = self.node256.write().await;
-                let mut node = node256.get(node_ref)?;
+                let mut node256 = self.node256.write();
+                let node = node256.get_mut(node_ref)?;
                 node.insert_child(key, child_ref)?;
-                node256.update(node_ref, node).map(|_| ())
+                Ok(())
             }
             _ => unreachable!(),
         }
@@ -901,24 +935,22 @@ impl BM25 {
 
         match parent_ref.kind {
             NodeKind::Node4 => {
-                let mut node4 = self.node4.write().await;
-                let mut node = node4.get(parent_ref)?;
+                let mut node4 = self.node4.write();
+                let node = node4.get_mut(parent_ref)?;
                 for i in 0..node.count as usize {
                     if node.keys[i] == key {
                         node.children[i] = node_ref;
-                        node4.update(parent_ref, node)?;
                         return Ok(());
                     }
                 }
                 unreachable!()
             }
             NodeKind::Node16 => {
-                let mut node16 = self.node16.write().await;
-                let mut node = node16.get(parent_ref)?;
+                let mut node16 = self.node16.write();
+                let node = node16.get_mut(parent_ref)?;
                 for i in 0..node.count as usize {
                     if node.keys[i] == key {
                         node.children[i] = node_ref;
-                        node16.update(parent_ref, node)?;
                         return Ok(());
                     }
                 }
@@ -926,25 +958,23 @@ impl BM25 {
                 unreachable!()
             }
             NodeKind::Node48 => {
-                let mut node48 = self.node48.write().await;
-                let mut node = node48.get(parent_ref)?;
+                let mut node48 = self.node48.write();
+                let node = node48.get_mut(parent_ref)?;
                 let key_index = node.keys[key as usize];
 
                 ensure!(key_index != u8::MAX);
 
                 node.children[key_index as usize] = node_ref;
-                node48.update(parent_ref, node)?;
                 Ok(())
             }
             NodeKind::Node256 => {
-                let mut node256 = self.node256.write().await;
-                let mut node = node256.get(parent_ref)?;
+                let mut node256 = self.node256.write();
+                let node = node256.get_mut(parent_ref)?;
                 let slot = key as usize;
 
                 ensure!(node.children[slot].kind != NodeKind::Empty);
 
                 node.children[slot] = node_ref;
-                node256.update(parent_ref, node)?;
                 Ok(())
             }
             _ => unreachable!(),
@@ -954,19 +984,23 @@ impl BM25 {
     async fn is_full(&self, node_ref: NodeRef) -> anyhow::Result<bool> {
         match node_ref.kind {
             NodeKind::Node4 => {
-                let node = self.node4.read().await.get(node_ref)?;
+                let nodes = self.node4.read();
+                let node = nodes.get(node_ref)?;
                 Ok(node.count as usize == node.children.len())
             }
             NodeKind::Node16 => {
-                let node = self.node16.read().await.get(node_ref)?;
+                let nodes = self.node16.read();
+                let node = nodes.get(node_ref)?;
                 Ok(node.count as usize == node.children.len())
             }
             NodeKind::Node48 => {
-                let node = self.node48.read().await.get(node_ref)?;
+                let nodes = self.node48.read();
+                let node = nodes.get(node_ref)?;
                 Ok(node.count as usize == node.children.len())
             }
             NodeKind::Node256 => {
-                let node = self.node256.read().await.get(node_ref)?;
+                let nodes = self.node256.read();
+                let node = nodes.get(node_ref)?;
                 Ok(node.count as usize == node.children.len())
             }
             _ => unreachable!(),
@@ -987,19 +1021,22 @@ impl BM25 {
     async fn grow_node(&self, node_ref: NodeRef) -> Result<NodeRef> {
         let grown_ref = match node_ref.kind {
             NodeKind::Node4 => {
-                let node = self.node4.read().await.get(node_ref)?;
-                let grown = Node16::from_node4(node);
-                self.node16.write().await.add(grown, self)?
+                let nodes = self.node4.read();
+                let node = nodes.get(node_ref)?;
+                let grown = Node16::from_node4(*node);
+                self.node16.write().add(grown, self)?
             }
             NodeKind::Node16 => {
-                let node = self.node16.read().await.get(node_ref)?;
-                let grown = Node48::from_node16(node);
-                self.node48.write().await.add(grown, self)?
+                let nodes = self.node16.read();
+                let node = nodes.get(node_ref)?;
+                let grown = Node48::from_node16(*node);
+                self.node48.write().add(grown, self)?
             }
             NodeKind::Node48 => {
-                let node = self.node48.read().await.get(node_ref)?;
-                let grown = Node256::from_node48(node);
-                self.node256.write().await.add(grown, self)?
+                let nodes = self.node48.read();
+                let node = nodes.get(node_ref)?;
+                let grown = Node256::from_node48(*node);
+                self.node256.write().add(grown, self)?
             }
             _ => unreachable!(),
         };
@@ -1010,7 +1047,7 @@ impl BM25 {
     async fn split_term_leaf(&self, leaf_ref: NodeRef) -> Result<NodeRef> {
         ensure!(leaf_ref.kind == NodeKind::TermLeaf);
 
-        let leaf = self.terms.read().await.get(leaf_ref)?;
+        let leaf = *self.terms.read().get(leaf_ref)?;
 
         let mut partitions = HashMap::new();
         let mut postings = NodeRef::default();
@@ -1054,7 +1091,7 @@ impl BM25 {
 
         let mut children = Vec::with_capacity(partitions.len());
         {
-            let mut terms = self.terms.write().await;
+            let mut terms = self.terms.write();
             for (key, child) in partitions {
                 let child_ref = terms.add(child, self)?;
                 children.push((key, child_ref));
@@ -1073,7 +1110,7 @@ impl BM25 {
                 }
 
                 let n4 = Node4::new(count, keys, child_slots, postings, doc_count);
-                self.node4.write().await.add(n4, self)
+                self.node4.write().add(n4, self)
             }
             5..=16 => {
                 let mut keys = [0; 16];
@@ -1085,7 +1122,7 @@ impl BM25 {
                 }
 
                 let n16 = Node16::new(count, keys, child_slots, postings, doc_count);
-                self.node16.write().await.add(n16, self)
+                self.node16.write().add(n16, self)
             }
             17..=48 => {
                 let mut keys = [u8::MAX; 256];
@@ -1097,7 +1134,7 @@ impl BM25 {
                 }
 
                 let n48 = Node48::new(count, keys, child_slots, postings, doc_count);
-                self.node48.write().await.add(n48, self)
+                self.node48.write().add(n48, self)
             }
             49..=254 => {
                 let mut keys = [0; 256];
@@ -1109,7 +1146,7 @@ impl BM25 {
                 }
 
                 let n256 = Node256::new(u16::from(count), keys, child_slots, postings, doc_count);
-                self.node256.write().await.add(n256, self)
+                self.node256.write().add(n256, self)
             }
             _ => unreachable!(),
         }
@@ -1137,8 +1174,10 @@ impl BM25 {
         ensure!(suffix.len() <= u8::MAX as usize);
 
         let header_len = size_of::<TermHeader>();
-        let mut leaf = self.terms.read().await.get(leaf_ref)?;
-        let (term, insert_at) = self.find_term(&leaf, suffix)?;
+        let (term, insert_at) = {
+            let terms = self.terms.read();
+            self.find_term(terms.get(leaf_ref)?, suffix)?
+        };
 
         if let Some((index, mut header)) = term {
             let old_postings = header.postings;
@@ -1152,15 +1191,16 @@ impl BM25 {
                 };
             }
 
-            let mut terms = self.terms.write().await;
-            leaf = terms.get(leaf_ref)?;
+            {
+                let mut terms = self.terms.write();
+                let leaf = terms.get_mut(leaf_ref)?;
 
-            let header_start = index * header_len;
-            let header_end = header_start + header_len;
-            let header_b = bytes_of(&header);
-            leaf.data[header_start..header_end].copy_from_slice(header_b);
+                let header_start = index * header_len;
+                let header_end = header_start + header_len;
+                let header_b = bytes_of(&header);
+                leaf.data[header_start..header_end].copy_from_slice(header_b);
+            }
 
-            terms.update(leaf_ref, leaf)?;
             if postings != old_postings {
                 self.to_remove.lock().await.push(old_postings);
             }
@@ -1209,7 +1249,7 @@ impl BM25 {
         doc_id: u64,
     ) -> Result<bool> {
         let header_len = size_of::<TermHeader>();
-        let mut leaf = self.terms.read().await.get(leaf_ref)?;
+        let leaf = *self.terms.read().get(leaf_ref)?;
 
         let count = leaf.count as usize;
         if leaf.count == u16::MAX {
@@ -1236,6 +1276,8 @@ impl BM25 {
             _pad: 0,
         };
 
+        let mut terms = self.terms.write();
+        let leaf = terms.get_mut(leaf_ref)?;
         leaf.data[suffix_start..suffix_end].copy_from_slice(suffix);
         leaf.suffix_start = suffix_start as u16;
 
@@ -1247,7 +1289,6 @@ impl BM25 {
         leaf.data[header_start..header_end].copy_from_slice(bytes_of(&header));
         leaf.count += 1;
 
-        self.terms.write().await.update(leaf_ref, leaf)?;
         Ok(true)
     }
 
@@ -1264,12 +1305,13 @@ impl BM25 {
 
         if node_ref.kind == NodeKind::Empty {
             let node = Node4::with_prefix(&bytes[..7]);
-            let mut n4 = self.node4.write().await;
+            let mut n4 = self.node4.write();
 
             node_ref = n4.add(node, self)?;
             updated_root = node_ref;
         }
 
+        // TODO: Only read the node once?
         let mut byte_pos = 0;
         'walk: while byte_pos < bytes.len() {
             let (prefix, prefix_len) = self.get_prefix(node_ref).await?;
@@ -1342,32 +1384,33 @@ impl BM25 {
             .leaf_or_create(root, doc_id, NodeKind::ScalarLeaf)
             .await?;
 
-        let prev = self.scalars.read().await.get(node_ref)?.value;
+        let prev = self.scalars.read().get(node_ref)?.value;
         let freq = match prev.checked_add(1) {
             Some(freq) => freq,
             None => anyhow::bail!("term frequency overflow"),
         };
 
         let new_leaf = ScalarLeaf::new(freq);
-        let mut postings = self.scalars.write().await;
-        postings.update(node_ref, new_leaf)?;
+        let mut postings = self.scalars.write();
+        postings.update(node_ref, &new_leaf)?;
 
         Ok((root, freq))
     }
 
     async fn set_doc_length(&self, doc_id: u64, len: u32) -> Result<()> {
-        let old_root = self.header.read().await.doc_root;
+        let old_root = self.header.read().doc_root;
         let (root, node_ref) = self
             .leaf_or_create(old_root, doc_id, NodeKind::ScalarLeaf)
             .await?;
 
         if root != old_root {
-            self.header.write().await.doc_root = root;
+            self.header.write().doc_root = root;
             self.to_remove.lock().await.push(old_root);
         }
 
-        let mut docs = self.scalars.write().await;
-        docs.update(node_ref, ScalarLeaf::new(len))?;
+        let mut docs = self.scalars.write();
+        let leaf = ScalarLeaf::new(len);
+        docs.update(node_ref, &leaf)?;
 
         Ok(())
     }
@@ -1383,15 +1426,15 @@ impl BM25 {
 
         let child_ref = match child_kind {
             NodeKind::Node4 => {
-                let mut node4 = self.node4.write().await;
+                let mut node4 = self.node4.write();
                 node4.add(Node4::default(), self)?
             }
             NodeKind::TermLeaf => {
-                let mut terms = self.terms.write().await;
+                let mut terms = self.terms.write();
                 terms.add(TermLeaf::default(), self)?
             }
             NodeKind::ScalarLeaf => {
-                let mut scalars = self.scalars.write().await;
+                let mut scalars = self.scalars.write();
                 scalars.add(ScalarLeaf::default(), self)?
             }
             _ => unreachable!(),
@@ -1407,7 +1450,7 @@ impl BM25 {
         let doc_id = self.get_doc_id();
         let tokens = tokenize(doc);
 
-        let old_root = self.header.read().await.term_root;
+        let old_root = self.header.read().term_root;
         let mut header_ref = old_root;
 
         let mut len = 0_u32;
@@ -1519,7 +1562,7 @@ impl BM25 {
     }
 
     async fn update_header(&self, term_root: NodeRef, len: u32) -> Result<()> {
-        let mut header = self.header.write().await;
+        let mut header = self.header.write();
 
         let doc_count = match header.doc_count.checked_add(1) {
             Some(count) => count,
@@ -1556,12 +1599,12 @@ impl BM25 {
         let started_at = std::time::Instant::now();
         while let Some(&node_ref) = to_remove.last() {
             match node_ref.kind {
-                NodeKind::Node4 => self.node4.write().await.remove(node_ref)?,
-                NodeKind::Node16 => self.node16.write().await.remove(node_ref)?,
-                NodeKind::Node48 => self.node48.write().await.remove(node_ref)?,
-                NodeKind::Node256 => self.node256.write().await.remove(node_ref)?,
-                NodeKind::TermLeaf => self.terms.write().await.remove(node_ref)?,
-                NodeKind::ScalarLeaf => self.scalars.write().await.remove(node_ref)?,
+                NodeKind::Node4 => self.node4.write().remove(node_ref)?,
+                NodeKind::Node16 => self.node16.write().remove(node_ref)?,
+                NodeKind::Node48 => self.node48.write().remove(node_ref)?,
+                NodeKind::Node256 => self.node256.write().remove(node_ref)?,
+                NodeKind::TermLeaf => self.terms.write().remove(node_ref)?,
+                NodeKind::ScalarLeaf => self.scalars.write().remove(node_ref)?,
                 NodeKind::Empty => anyhow::bail!("cannot remove an empty node"),
             }
 

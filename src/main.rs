@@ -1,6 +1,6 @@
 use crate::server::serve;
-use haku::{Args, BM25, IO};
 use clap::Parser;
+use haku::{Args, BM25, IO};
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
