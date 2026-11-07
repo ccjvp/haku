@@ -108,6 +108,8 @@ impl NodeRef {
 #[derive(Clone, Copy, Default)]
 struct Node4 {
     count: u8,
+    prefix: [u8; 7],
+    prefix_len: u8,
     keys: [u8; 4],
     children: [NodeRef; 4],
     postings: NodeRef,
@@ -115,6 +117,15 @@ struct Node4 {
 }
 
 impl Node4 {
+    fn with_prefix(prefix: &[u8]) -> Self {
+        assert!(prefix.len() <= 7);
+
+        let mut node = Self::default();
+        node.prefix[..prefix.len()].copy_from_slice(prefix);
+        node.prefix_len = prefix.len() as u8;
+        node
+    }
+
     fn new(
         count: u8,
         keys: [u8; 4],
@@ -124,6 +135,8 @@ impl Node4 {
     ) -> Self {
         Self {
             count,
+            prefix: [0; 7],
+            prefix_len: 0,
             keys,
             children,
             postings,
@@ -154,6 +167,8 @@ impl Node4 {
 #[derive(Clone, Copy, Default)]
 struct Node16 {
     count: u8,
+    prefix: [u8; 7],
+    prefix_len: u8,
     keys: [u8; 16],
     children: [NodeRef; 16],
     postings: NodeRef,
@@ -170,7 +185,15 @@ impl Node16 {
         let mut children = [NodeRef::default(); 16];
         children[..count as usize].copy_from_slice(&node.children[..count]);
 
-        Self::new(node.count, keys, children, node.postings, node.doc_count)
+        Self {
+            count: node.count,
+            prefix: node.prefix,
+            prefix_len: node.prefix_len,
+            keys,
+            children,
+            postings: node.postings,
+            doc_count: node.doc_count,
+        }
     }
 
     fn new(
@@ -182,6 +205,8 @@ impl Node16 {
     ) -> Self {
         Self {
             count,
+            prefix: [0; 7],
+            prefix_len: 0,
             keys,
             children,
             postings,
@@ -215,6 +240,8 @@ impl Node16 {
 #[derive(Clone, Copy)]
 struct Node48 {
     count: u8,
+    prefix: [u8; 7],
+    prefix_len: u8,
     keys: [u8; 256],
     children: [NodeRef; 48],
     postings: NodeRef,
@@ -233,7 +260,15 @@ impl Node48 {
             children[i] = node.children[i];
         }
 
-        Self::new(node.count, keys, children, node.postings, node.doc_count)
+        Self {
+            count: node.count,
+            prefix: node.prefix,
+            prefix_len: node.prefix_len,
+            keys,
+            children,
+            postings: node.postings,
+            doc_count: node.doc_count,
+        }
     }
 
     fn new(
@@ -245,6 +280,8 @@ impl Node48 {
     ) -> Self {
         Self {
             count,
+            prefix: [0; 7],
+            prefix_len: 0,
             keys,
             children,
             postings,
@@ -289,6 +326,8 @@ impl Default for Node48 {
 #[derive(Clone, Copy)]
 struct Node256 {
     count: u16,
+    prefix: [u8; 7],
+    prefix_len: u8,
     keys: [u8; 256],
     children: [NodeRef; 256],
     postings: NodeRef,
@@ -307,13 +346,15 @@ impl Node256 {
             }
         }
 
-        Self::new(
-            u16::from(node.count),
+        Self {
+            count: u16::from(node.count),
+            prefix: node.prefix,
+            prefix_len: node.prefix_len,
             keys,
             children,
-            node.postings,
-            node.doc_count,
-        )
+            postings: node.postings,
+            doc_count: node.doc_count,
+        }
     }
 
     fn new(
@@ -325,6 +366,8 @@ impl Node256 {
     ) -> Self {
         Self {
             count,
+            prefix: [0; 7],
+            prefix_len: 0,
             keys,
             children,
             postings,
@@ -407,6 +450,7 @@ impl<T: Copy + Default, const N: usize, const B: usize> Allocator<T, N, B> {
         }
     }
 
+    // TODO: Make this return a reference?
     fn get(&self, node_ref: NodeRef) -> Result<T> {
         let buf = self.bufs.get(&node_ref.buf_id);
         Ok(buf.unwrap().get(node_ref.slot))
@@ -556,7 +600,7 @@ impl BM25 {
         };
 
         let term_root = bm25.terms.write().await.add(TermLeaf::default(), &bm25)?;
-        let doc_root = bm25.node4.write().await.add(Node4::default(), &bm25)?;
+        let doc_root = NodeRef::default();
 
         let header: Header = match handle {
             Ok(handle) => {
@@ -587,6 +631,145 @@ impl BM25 {
 
     fn _write(&self, _path: &str) -> Result<()> {
         todo!("Save the index")
+    }
+
+    async fn get_prefix(&self, node_ref: NodeRef) -> Result<([u8; 7], usize)> {
+        match node_ref.kind {
+            NodeKind::Node4 => {
+                let node = self.node4.read().await.get(node_ref)?;
+                Ok((node.prefix, node.prefix_len as usize))
+            }
+            NodeKind::Node16 => {
+                let node = self.node16.read().await.get(node_ref)?;
+                Ok((node.prefix, node.prefix_len as usize))
+            }
+            NodeKind::Node48 => {
+                let node = self.node48.read().await.get(node_ref)?;
+                Ok((node.prefix, node.prefix_len as usize))
+            }
+            NodeKind::Node256 => {
+                let node = self.node256.read().await.get(node_ref)?;
+                Ok((node.prefix, node.prefix_len as usize))
+            }
+            NodeKind::Empty | NodeKind::TermLeaf | NodeKind::ScalarLeaf => {
+                anyhow::bail!("cannot get a prefix from a non-internal node")
+            }
+        }
+    }
+
+    // In place is ok as this is ever done before attaching the node
+    async fn set_prefix(&self, node_ref: NodeRef, prefix: &[u8]) -> Result<()> {
+        ensure!(prefix.len() <= 7, "prefix exceeds the node prefix capacity");
+
+        let mut padded_prefix = [0; 7];
+        padded_prefix[..prefix.len()].copy_from_slice(prefix);
+
+        match node_ref.kind {
+            NodeKind::Node4 => {
+                let mut nodes = self.node4.write().await;
+                let mut node = nodes.get(node_ref)?;
+                node.prefix = padded_prefix;
+                node.prefix_len = prefix.len() as u8;
+                nodes.update(node_ref, node).map(|_| ())
+            }
+            NodeKind::Node16 => {
+                let mut nodes = self.node16.write().await;
+                let mut node = nodes.get(node_ref)?;
+                node.prefix = padded_prefix;
+                node.prefix_len = prefix.len() as u8;
+                nodes.update(node_ref, node).map(|_| ())
+            }
+            NodeKind::Node48 => {
+                let mut nodes = self.node48.write().await;
+                let mut node = nodes.get(node_ref)?;
+                node.prefix = padded_prefix;
+                node.prefix_len = prefix.len() as u8;
+                nodes.update(node_ref, node).map(|_| ())
+            }
+            NodeKind::Node256 => {
+                let mut nodes = self.node256.write().await;
+                let mut node = nodes.get(node_ref)?;
+                node.prefix = padded_prefix;
+                node.prefix_len = prefix.len() as u8;
+                nodes.update(node_ref, node).map(|_| ())
+            }
+            NodeKind::Empty | NodeKind::TermLeaf | NodeKind::ScalarLeaf => {
+                anyhow::bail!("cannot set a prefix on a non-internal node")
+            }
+        }
+    }
+
+    async fn copy_with_prefix(&self, node_ref: NodeRef, prefix: &[u8]) -> Result<NodeRef> {
+        ensure!(prefix.len() <= 7, "prefix exceeds the node prefix capacity");
+
+        match node_ref.kind {
+            NodeKind::Node4 => {
+                let mut node = self.node4.read().await.get(node_ref)?;
+                node.prefix = [0; 7];
+                node.prefix[..prefix.len()].copy_from_slice(prefix);
+                node.prefix_len = prefix.len() as u8;
+                Ok(self.node4.write().await.add(node, self)?)
+            }
+            NodeKind::Node16 => {
+                let mut node = self.node16.read().await.get(node_ref)?;
+                node.prefix = [0; 7];
+                node.prefix[..prefix.len()].copy_from_slice(prefix);
+                node.prefix_len = prefix.len() as u8;
+                Ok(self.node16.write().await.add(node, self)?)
+            }
+            NodeKind::Node48 => {
+                let mut node = self.node48.read().await.get(node_ref)?;
+                node.prefix = [0; 7];
+                node.prefix[..prefix.len()].copy_from_slice(prefix);
+                node.prefix_len = prefix.len() as u8;
+                Ok(self.node48.write().await.add(node, self)?)
+            }
+            NodeKind::Node256 => {
+                let mut node = self.node256.read().await.get(node_ref)?;
+                node.prefix = [0; 7];
+                node.prefix[..prefix.len()].copy_from_slice(prefix);
+                node.prefix_len = prefix.len() as u8;
+                Ok(self.node256.write().await.add(node, self)?)
+            }
+            NodeKind::Empty | NodeKind::TermLeaf | NodeKind::ScalarLeaf => {
+                anyhow::bail!("cannot copy a prefix onto a non-internal node")
+            }
+        }
+    }
+
+    async fn split_prefix(
+        &self,
+        node_ref: NodeRef,
+        prefix: &[u8],
+        prefix_len: usize,
+        bytes: &[u8],
+        byte_pos: usize,
+        split_at: usize,
+    ) -> Result<(NodeRef, NodeRef)> {
+        let new_ref = {
+            let mut n4 = self.node4.write().await;
+            let range = byte_pos + split_at + 1..bytes.len() - 1;
+            n4.add(Node4::with_prefix(&bytes[range]), self)?
+        };
+
+        let bottom_ref = self
+            .copy_with_prefix(node_ref, &prefix[split_at + 1..prefix_len])
+            .await?;
+
+        let mut branch_ref = {
+            let mut n4 = self.node4.write().await;
+            n4.add(Node4::with_prefix(&prefix[..split_at]), self)?
+        };
+
+        branch_ref = self
+            .insert_child(Edge::new(branch_ref, prefix[split_at]), bottom_ref)
+            .await?;
+
+        branch_ref = self
+            .insert_child(Edge::new(branch_ref, bytes[byte_pos + split_at]), new_ref)
+            .await?;
+
+        Ok((branch_ref, new_ref))
     }
 
     async fn get_postings(&self, node_ref: NodeRef) -> anyhow::Result<(NodeRef, u32)> {
@@ -958,12 +1141,6 @@ impl BM25 {
         let (term, insert_at) = self.find_term(&leaf, suffix)?;
 
         if let Some((index, mut header)) = term {
-            if header.postings.kind == NodeKind::Empty {
-                let mut node4 = self.node4.write().await;
-                let n4 = node4.add(Node4::default(), self)?;
-                header.postings = n4;
-            }
-
             let old_postings = header.postings;
             let (postings, freq) = self.update_postings(old_postings, doc_id).await?;
             header.postings = postings;
@@ -1020,11 +1197,7 @@ impl BM25 {
     }
 
     async fn create_postings(&self, doc_id: u64) -> Result<NodeRef> {
-        let root = {
-            let mut node4 = self.node4.write().await;
-            node4.add(Node4::default(), self)?
-        };
-        let (root, _) = self.update_postings(root, doc_id).await?;
+        let (root, _) = self.update_postings(NodeRef::default(), doc_id).await?;
         Ok(root)
     }
 
@@ -1089,28 +1262,75 @@ impl BM25 {
         let mut node_ref = root;
         let mut parent: Option<Edge> = None;
 
-        for (pos, &key) in bytes.iter().enumerate() {
-            let child_kind = if pos + 1 < bytes.len() {
+        if node_ref.kind == NodeKind::Empty {
+            let node = Node4::with_prefix(&bytes[..7]);
+            let mut n4 = self.node4.write().await;
+
+            node_ref = n4.add(node, self)?;
+            updated_root = node_ref;
+        }
+
+        let mut byte_pos = 0;
+        'walk: while byte_pos < bytes.len() {
+            let (prefix, prefix_len) = self.get_prefix(node_ref).await?;
+
+            for i in 0..prefix_len {
+                if prefix[i] != bytes[byte_pos + i] {
+                    let (branch_ref, new_ref) = self
+                        .split_prefix(node_ref, &prefix, prefix_len, &bytes, byte_pos, i)
+                        .await?;
+
+                    if let Some(edge) = parent {
+                        self.insert_node(edge, branch_ref).await?;
+                    } else {
+                        updated_root = branch_ref;
+                    }
+
+                    self.to_remove.lock().await.push(node_ref);
+
+                    node_ref = new_ref;
+                    byte_pos += i + 1;
+                    continue 'walk;
+                } else if i == prefix_len - 1 {
+                    byte_pos += prefix_len;
+                }
+            }
+
+            let key = bytes[byte_pos];
+
+            let child_kind = if byte_pos + 1 < bytes.len() {
                 NodeKind::Node4
             } else {
                 leaf_kind
             };
 
-            let (updated_ref, child_ref) = self
+            let (updated_ref, child_ref, child_created) = self
                 .child_or_create(Edge::new(node_ref, key), child_kind)
                 .await?;
+
+            if child_created && child_kind == NodeKind::Node4 {
+                let prefix = &bytes[byte_pos + 1..7];
+                self.set_prefix(child_ref, prefix).await?;
+            }
 
             if updated_ref != node_ref {
                 if let Some(edge) = parent {
                     self.insert_node(edge, updated_ref).await?;
-                    self.to_remove.lock().await.push(node_ref);
                 } else {
                     updated_root = updated_ref;
                 }
+
+                self.to_remove.lock().await.push(node_ref);
             }
 
             parent = Some(Edge::new(updated_ref, key));
             node_ref = child_ref;
+
+            if node_ref.kind == leaf_kind {
+                break;
+            }
+
+            byte_pos += 1;
         }
 
         anyhow::ensure!(node_ref.kind == leaf_kind);
@@ -1156,9 +1376,9 @@ impl BM25 {
         &self,
         edge: Edge,
         child_kind: NodeKind,
-    ) -> anyhow::Result<(NodeRef, NodeRef)> {
+    ) -> anyhow::Result<(NodeRef, NodeRef, bool)> {
         if let Some(child_ref) = self.child_for(edge).await? {
-            return Ok((edge.node_ref, child_ref));
+            return Ok((edge.node_ref, child_ref, false));
         }
 
         let child_ref = match child_kind {
@@ -1179,7 +1399,7 @@ impl BM25 {
 
         let updated_ref = self.insert_child(edge, child_ref).await?;
 
-        Ok((updated_ref, child_ref))
+        Ok((updated_ref, child_ref, true))
     }
 
     pub async fn add(&self, doc: &str) -> Result<()> {
@@ -1255,7 +1475,7 @@ impl BM25 {
                             NodeKind::TermLeaf
                         };
 
-                        let (updated_ref, child_ref) = self
+                        let (updated_ref, child_ref, _) = self
                             .child_or_create(Edge::new(node_ref, key), child_kind)
                             .await?;
 
