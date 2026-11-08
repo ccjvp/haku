@@ -1,7 +1,7 @@
 use crate::{args::Args, bitmap::Bitmap, io::IO, tokenizer::tokenize};
 use anyhow::{Result, ensure};
 use bytemuck::{CheckedBitPattern, NoUninit, bytes_of, checked::try_pod_read_unaligned};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::{
     cmp::Ordering,
     collections::HashMap,
@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicU32, AtomicU64, AtomicUsize},
     },
 };
-use tokio::{fs, sync::Mutex};
+use tokio::fs;
 
 #[derive(Clone, Copy, Default)]
 struct ScalarLeaf {
@@ -373,6 +373,7 @@ impl Node256 {
         }
     }
 
+    #[inline(always)]
     fn child_for(&self, key: u8) -> Option<NodeRef> {
         let child = self.children[key as usize];
         (child.kind != NodeKind::Empty).then_some(child)
@@ -577,7 +578,7 @@ impl Header {
 pub struct BM25 {
     header: RwLock<Header>,
     to_remove: Mutex<Vec<NodeRef>>,
-    update_guard: Mutex<()>,
+    update_guard: tokio::sync::Mutex<()>,
     active_readers: AtomicUsize,
     buf_id: AtomicU32,
     doc_id: AtomicU64,
@@ -643,7 +644,7 @@ impl BM25 {
         todo!("Save the index")
     }
 
-    async fn get_prefix(&self, node_ref: NodeRef) -> Result<([u8; 7], usize)> {
+    fn get_prefix(&self, node_ref: NodeRef) -> Result<([u8; 7], usize)> {
         match node_ref.kind {
             NodeKind::Node4 => {
                 let n4 = self.node4.read();
@@ -672,7 +673,7 @@ impl BM25 {
     }
 
     // In place is ok as this is ever done before attaching the node
-    async fn set_prefix(&self, node_ref: NodeRef, prefix: &[u8]) -> Result<()> {
+    fn set_prefix(&self, node_ref: NodeRef, prefix: &[u8]) -> Result<()> {
         ensure!(prefix.len() <= 7, "prefix exceeds the node prefix capacity");
 
         let mut padded_prefix = [0; 7];
@@ -711,7 +712,7 @@ impl BM25 {
         Ok(())
     }
 
-    async fn copy_with_prefix(&self, node_ref: NodeRef, prefix: &[u8]) -> Result<NodeRef> {
+    fn copy_with_prefix(&self, node_ref: NodeRef, prefix: &[u8]) -> Result<NodeRef> {
         ensure!(prefix.len() <= 7, "prefix exceeds the node prefix capacity");
 
         match node_ref.kind {
@@ -765,7 +766,7 @@ impl BM25 {
         }
     }
 
-    async fn split_prefix(
+    fn split_prefix(
         &self,
         node_ref: NodeRef,
         prefix: &[u8],
@@ -780,9 +781,7 @@ impl BM25 {
             n4.add(Node4::with_prefix(&bytes[range]), self)?
         };
 
-        let bottom_ref = self
-            .copy_with_prefix(node_ref, &prefix[split_at + 1..prefix_len])
-            .await?;
+        let bottom_ref = self.copy_with_prefix(node_ref, &prefix[split_at + 1..prefix_len])?;
 
         let mut branch_ref = {
             let mut n4 = self.node4.write();
@@ -790,15 +789,15 @@ impl BM25 {
         };
 
         let to_bottom = Edge::new(branch_ref, prefix[split_at]);
-        branch_ref = self.insert_child(to_bottom, bottom_ref).await?;
+        branch_ref = self.insert_child(to_bottom, bottom_ref)?;
 
         let to_new = Edge::new(branch_ref, bytes[byte_pos + split_at]);
-        branch_ref = self.insert_child(to_new, new_ref).await?;
+        branch_ref = self.insert_child(to_new, new_ref)?;
 
         Ok((branch_ref, new_ref))
     }
 
-    async fn get_postings(&self, node_ref: NodeRef) -> anyhow::Result<(NodeRef, u32)> {
+    fn get_postings(&self, node_ref: NodeRef) -> anyhow::Result<(NodeRef, u32)> {
         match node_ref.kind {
             NodeKind::Node4 => {
                 let nodes = self.node4.read();
@@ -826,7 +825,7 @@ impl BM25 {
         }
     }
 
-    async fn set_postings(
+    fn set_postings(
         &self,
         node_ref: NodeRef,
         postings: NodeRef,
@@ -867,7 +866,7 @@ impl BM25 {
         }
     }
 
-    async fn child_for(&self, edge: Edge) -> anyhow::Result<Option<NodeRef>> {
+    fn child_for(&self, edge: Edge) -> anyhow::Result<Option<NodeRef>> {
         let Edge { node_ref, key } = edge;
 
         match node_ref.kind {
@@ -895,7 +894,7 @@ impl BM25 {
         }
     }
 
-    async fn update_node(&self, edge: Edge, child_ref: NodeRef) -> anyhow::Result<()> {
+    fn update_node(&self, edge: Edge, child_ref: NodeRef) -> anyhow::Result<()> {
         let Edge { node_ref, key } = edge;
 
         match node_ref.kind {
@@ -927,7 +926,7 @@ impl BM25 {
         }
     }
 
-    async fn insert_node(&self, edge: Edge, node_ref: NodeRef) -> anyhow::Result<()> {
+    fn insert_node(&self, edge: Edge, node_ref: NodeRef) -> anyhow::Result<()> {
         let Edge {
             node_ref: parent_ref,
             key,
@@ -981,7 +980,7 @@ impl BM25 {
         }
     }
 
-    async fn is_full(&self, node_ref: NodeRef) -> anyhow::Result<bool> {
+    fn is_full(&self, node_ref: NodeRef) -> anyhow::Result<bool> {
         match node_ref.kind {
             NodeKind::Node4 => {
                 let nodes = self.node4.read();
@@ -1007,18 +1006,18 @@ impl BM25 {
         }
     }
 
-    async fn insert_child(&self, mut edge: Edge, child_ref: NodeRef) -> anyhow::Result<NodeRef> {
-        anyhow::ensure!(self.child_for(edge).await?.is_none());
+    fn insert_child(&self, mut edge: Edge, child_ref: NodeRef) -> anyhow::Result<NodeRef> {
+        anyhow::ensure!(self.child_for(edge)?.is_none());
 
-        if self.is_full(edge.node_ref).await? {
-            edge.node_ref = self.grow_node(edge.node_ref).await?;
+        if self.is_full(edge.node_ref)? {
+            edge.node_ref = self.grow_node(edge.node_ref)?;
         }
 
-        self.update_node(edge, child_ref).await?;
+        self.update_node(edge, child_ref)?;
         Ok(edge.node_ref)
     }
 
-    async fn grow_node(&self, node_ref: NodeRef) -> Result<NodeRef> {
+    fn grow_node(&self, node_ref: NodeRef) -> Result<NodeRef> {
         let grown_ref = match node_ref.kind {
             NodeKind::Node4 => {
                 let nodes = self.node4.read();
@@ -1044,7 +1043,7 @@ impl BM25 {
         Ok(grown_ref)
     }
 
-    async fn split_term_leaf(&self, leaf_ref: NodeRef) -> Result<NodeRef> {
+    fn split_term_leaf(&self, leaf_ref: NodeRef) -> Result<NodeRef> {
         ensure!(leaf_ref.kind == NodeKind::TermLeaf);
 
         let leaf = *self.terms.read().get(leaf_ref)?;
@@ -1202,7 +1201,7 @@ impl BM25 {
             }
 
             if postings != old_postings {
-                self.to_remove.lock().await.push(old_postings);
+                self.to_remove.lock().push(old_postings);
             }
 
             return Ok(true);
@@ -1314,21 +1313,20 @@ impl BM25 {
         // TODO: Only read the node once?
         let mut byte_pos = 0;
         'walk: while byte_pos < bytes.len() {
-            let (prefix, prefix_len) = self.get_prefix(node_ref).await?;
+            let (prefix, prefix_len) = self.get_prefix(node_ref)?;
 
             for i in 0..prefix_len {
                 if prefix[i] != bytes[byte_pos + i] {
-                    let (branch_ref, new_ref) = self
-                        .split_prefix(node_ref, &prefix, prefix_len, &bytes, byte_pos, i)
-                        .await?;
+                    let (branch_ref, new_ref) =
+                        self.split_prefix(node_ref, &prefix, prefix_len, &bytes, byte_pos, i)?;
 
                     if let Some(edge) = parent {
-                        self.insert_node(edge, branch_ref).await?;
+                        self.insert_node(edge, branch_ref)?;
                     } else {
                         updated_root = branch_ref;
                     }
 
-                    self.to_remove.lock().await.push(node_ref);
+                    self.to_remove.lock().push(node_ref);
 
                     node_ref = new_ref;
                     byte_pos += i + 1;
@@ -1346,23 +1344,22 @@ impl BM25 {
                 leaf_kind
             };
 
-            let (updated_ref, child_ref, child_created) = self
-                .child_or_create(Edge::new(node_ref, key), child_kind)
-                .await?;
+            let (updated_ref, child_ref, child_created) =
+                self.child_or_create(Edge::new(node_ref, key), child_kind)?;
 
             if child_created && child_kind == NodeKind::Node4 {
                 let prefix = &bytes[byte_pos + 1..7];
-                self.set_prefix(child_ref, prefix).await?;
+                self.set_prefix(child_ref, prefix)?;
             }
 
             if updated_ref != node_ref {
                 if let Some(edge) = parent {
-                    self.insert_node(edge, updated_ref).await?;
+                    self.insert_node(edge, updated_ref)?;
                 } else {
                     updated_root = updated_ref;
                 }
 
-                self.to_remove.lock().await.push(node_ref);
+                self.to_remove.lock().push(node_ref);
             }
 
             parent = Some(Edge::new(updated_ref, key));
@@ -1405,7 +1402,7 @@ impl BM25 {
 
         if root != old_root {
             self.header.write().doc_root = root;
-            self.to_remove.lock().await.push(old_root);
+            self.to_remove.lock().push(old_root);
         }
 
         let mut docs = self.scalars.write();
@@ -1415,12 +1412,18 @@ impl BM25 {
         Ok(())
     }
 
-    async fn child_or_create(
+    #[inline(never)]
+    fn create_scalar_leaf(&self) -> Result<NodeRef> {
+        let mut scalars = self.scalars.write();
+        scalars.add(ScalarLeaf::default(), self)
+    }
+
+    fn child_or_create(
         &self,
         edge: Edge,
         child_kind: NodeKind,
-    ) -> anyhow::Result<(NodeRef, NodeRef, bool)> {
-        if let Some(child_ref) = self.child_for(edge).await? {
+    ) -> Result<(NodeRef, NodeRef, bool)> {
+        if let Some(child_ref) = self.child_for(edge)? {
             return Ok((edge.node_ref, child_ref, false));
         }
 
@@ -1433,14 +1436,11 @@ impl BM25 {
                 let mut terms = self.terms.write();
                 terms.add(TermLeaf::default(), self)?
             }
-            NodeKind::ScalarLeaf => {
-                let mut scalars = self.scalars.write();
-                scalars.add(ScalarLeaf::default(), self)?
-            }
+            NodeKind::ScalarLeaf => self.create_scalar_leaf()?,
             _ => unreachable!(),
         };
 
-        let updated_ref = self.insert_child(edge, child_ref).await?;
+        let updated_ref = self.insert_child(edge, child_ref)?;
 
         Ok((updated_ref, child_ref, true))
     }
@@ -1471,22 +1471,22 @@ impl BM25 {
                             }
                         }
 
-                        let updated_ref = self.split_term_leaf(node_ref).await?;
+                        let updated_ref = self.split_term_leaf(node_ref)?;
                         if let Some(parent) = parent {
-                            self.insert_node(parent, updated_ref).await?;
+                            self.insert_node(parent, updated_ref)?;
                         } else {
                             header_ref = updated_ref;
                         }
 
                         if node_ref != old_root {
-                            self.to_remove.lock().await.push(node_ref);
+                            self.to_remove.lock().push(node_ref);
                         }
 
                         node_ref = updated_ref;
                     }
                     NodeKind::Node4 | NodeKind::Node16 | NodeKind::Node48 | NodeKind::Node256 => {
                         let Some(&key) = bytes.get(pos) else {
-                            let (old_postings, doc_count) = self.get_postings(node_ref).await?;
+                            let (old_postings, doc_count) = self.get_postings(node_ref)?;
 
                             let (postings, freq) = if old_postings.kind == NodeKind::Empty {
                                 (self.create_postings(doc_id).await?, 1)
@@ -1503,9 +1503,9 @@ impl BM25 {
                                 doc_count
                             };
 
-                            self.set_postings(node_ref, postings, doc_count).await?;
+                            self.set_postings(node_ref, postings, doc_count)?;
                             if old_postings.kind != NodeKind::Empty && postings != old_postings {
-                                self.to_remove.lock().await.push(old_postings);
+                                self.to_remove.lock().push(old_postings);
                             }
 
                             break;
@@ -1518,19 +1518,18 @@ impl BM25 {
                             NodeKind::TermLeaf
                         };
 
-                        let (updated_ref, child_ref, _) = self
-                            .child_or_create(Edge::new(node_ref, key), child_kind)
-                            .await?;
+                        let (updated_ref, child_ref, _) =
+                            self.child_or_create(Edge::new(node_ref, key), child_kind)?;
 
                         if updated_ref != node_ref {
                             if let Some(parent) = parent {
-                                self.insert_node(parent, updated_ref).await?;
+                                self.insert_node(parent, updated_ref)?;
                             } else {
                                 header_ref = updated_ref;
                             }
 
                             if node_ref != old_root {
-                                self.to_remove.lock().await.push(node_ref);
+                                self.to_remove.lock().push(node_ref);
                             }
                         }
 
@@ -1549,10 +1548,10 @@ impl BM25 {
         }
 
         self.set_doc_length(doc_id, len).await?;
-        self.update_header(header_ref, len).await?;
+        self.update_header(header_ref, len)?;
 
         if header_ref != old_root {
-            self.to_remove.lock().await.push(old_root);
+            self.to_remove.lock().push(old_root);
         }
 
         let elapsed_ms = started_at.elapsed().as_millis();
@@ -1561,7 +1560,7 @@ impl BM25 {
         Ok(())
     }
 
-    async fn update_header(&self, term_root: NodeRef, len: u32) -> Result<()> {
+    fn update_header(&self, term_root: NodeRef, len: u32) -> Result<()> {
         let mut header = self.header.write();
 
         let doc_count = match header.doc_count.checked_add(1) {
@@ -1591,7 +1590,7 @@ impl BM25 {
             return Ok(());
         }
 
-        let mut to_remove = self.to_remove.lock().await;
+        let mut to_remove = self.to_remove.lock();
         if to_remove.is_empty() {
             return Ok(());
         }
