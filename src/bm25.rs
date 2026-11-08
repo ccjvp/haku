@@ -453,7 +453,6 @@ impl<T: Copy + Default, const N: usize, const B: usize> Allocator<T, N, B> {
         }
     }
 
-    // TODO: Make this return a reference?
     fn get(&self, node_ref: NodeRef) -> Result<&T> {
         let buf = self.bufs.get(&node_ref.buf_id);
         Ok(buf.unwrap().get(node_ref.slot))
@@ -544,7 +543,7 @@ impl<T: Copy + Default, const N: usize, const B: usize> Allocator<T, N, B> {
         buf.slots[slot] = node;
         buf.free.set(slot, false);
 
-        // TODO: Cache if the birmap has space?
+        // TODO: Cache if the bitmap has space?
         if buf.free.words.iter().any(|&word| word != 0) {
             self.free.push(buf_id);
         }
@@ -1169,6 +1168,7 @@ impl BM25 {
         leaf_ref: NodeRef,
         suffix: &[u8],
         doc_id: u64,
+        freq: u32,
     ) -> Result<bool> {
         ensure!(suffix.len() <= u8::MAX as usize);
 
@@ -1180,10 +1180,10 @@ impl BM25 {
 
         if let Some((index, mut header)) = term {
             let old_postings = header.postings;
-            let (postings, freq) = self.update_postings(old_postings, doc_id).await?;
+            let (postings, updated_freq) = self.update_postings(old_postings, doc_id, freq).await?;
             header.postings = postings;
 
-            if freq == 1 {
+            if freq == updated_freq {
                 header.doc_count = match header.doc_count.checked_add(1) {
                     Some(doc_count) => doc_count,
                     None => anyhow::bail!("term document count overflow"),
@@ -1207,7 +1207,8 @@ impl BM25 {
             return Ok(true);
         }
 
-        self.insert_term(leaf_ref, suffix, insert_at, doc_id).await
+        self.insert_term(leaf_ref, suffix, insert_at, doc_id, freq)
+            .await
     }
 
     fn find_term(
@@ -1235,8 +1236,9 @@ impl BM25 {
         Ok((None, insert_at))
     }
 
-    async fn create_postings(&self, doc_id: u64) -> Result<NodeRef> {
-        let (root, _) = self.update_postings(NodeRef::default(), doc_id).await?;
+    async fn create_postings(&self, doc_id: u64, freq: u32) -> Result<NodeRef> {
+        let node = NodeRef::default();
+        let (root, _) = self.update_postings(node, doc_id, freq).await?;
         Ok(root)
     }
 
@@ -1246,6 +1248,7 @@ impl BM25 {
         suffix: &[u8],
         insert_at: usize,
         doc_id: u64,
+        freq: u32,
     ) -> Result<bool> {
         let header_len = size_of::<TermHeader>();
         let leaf = *self.terms.read().get(leaf_ref)?;
@@ -1265,7 +1268,7 @@ impl BM25 {
             return Ok(false);
         }
 
-        let postings = self.create_postings(doc_id).await?;
+        let postings = self.create_postings(doc_id, freq).await?;
 
         let header = TermHeader {
             offset: suffix_start as u16,
@@ -1376,22 +1379,27 @@ impl BM25 {
         Ok((updated_root, node_ref))
     }
 
-    async fn update_postings(&self, root: NodeRef, doc_id: u64) -> Result<(NodeRef, u32)> {
+    async fn update_postings(
+        &self,
+        root: NodeRef,
+        doc_id: u64,
+        token_count: u32,
+    ) -> Result<(NodeRef, u32)> {
         let (root, node_ref) = self
             .leaf_or_create(root, doc_id, NodeKind::ScalarLeaf)
             .await?;
 
         let prev = self.scalars.read().get(node_ref)?.value;
-        let freq = match prev.checked_add(1) {
-            Some(freq) => freq,
+        let updated_freq = match prev.checked_add(token_count) {
+            Some(updated_freq) => updated_freq,
             None => anyhow::bail!("term frequency overflow"),
         };
 
-        let new_leaf = ScalarLeaf::new(freq);
+        let new_leaf = ScalarLeaf::new(updated_freq);
         let mut postings = self.scalars.write();
         postings.update(node_ref, &new_leaf)?;
 
-        Ok((root, freq))
+        Ok((root, updated_freq))
     }
 
     async fn set_doc_length(&self, doc_id: u64, len: u32) -> Result<()> {
@@ -1445,6 +1453,7 @@ impl BM25 {
         Ok((updated_ref, child_ref, true))
     }
 
+    // TODO: CAS
     pub async fn add(&self, doc: &str) -> Result<()> {
         let started_at = std::time::Instant::now();
         let doc_id = self.get_doc_id();
@@ -1454,7 +1463,7 @@ impl BM25 {
         let mut header_ref = old_root;
 
         let mut len = 0_u32;
-        for token in tokens {
+        for (token, freq) in tokens {
             let bytes = token.as_bytes();
 
             let mut node_ref = header_ref;
@@ -1466,7 +1475,10 @@ impl BM25 {
                     NodeKind::TermLeaf => {
                         let suffix = &bytes[pos..];
                         if suffix.len() <= u8::MAX as usize {
-                            if self.update_term_leaf(node_ref, suffix, doc_id).await? {
+                            if self
+                                .update_term_leaf(node_ref, suffix, doc_id, freq)
+                                .await?
+                            {
                                 break;
                             }
                         }
@@ -1488,13 +1500,13 @@ impl BM25 {
                         let Some(&key) = bytes.get(pos) else {
                             let (old_postings, doc_count) = self.get_postings(node_ref)?;
 
-                            let (postings, freq) = if old_postings.kind == NodeKind::Empty {
-                                (self.create_postings(doc_id).await?, 1)
+                            let (postings, updated_freq) = if old_postings.kind == NodeKind::Empty {
+                                (self.create_postings(doc_id, freq).await?, freq)
                             } else {
-                                self.update_postings(old_postings, doc_id).await?
+                                self.update_postings(old_postings, doc_id, freq).await?
                             };
 
-                            let doc_count = if freq == 1 {
+                            let doc_count = if freq == updated_freq {
                                 match doc_count.checked_add(1) {
                                     Some(count) => count,
                                     None => anyhow::bail!("term document count overflow"),
@@ -1541,7 +1553,7 @@ impl BM25 {
                 }
             }
 
-            len = match len.checked_add(1) {
+            len = match len.checked_add(freq) {
                 Some(len) => len,
                 None => anyhow::bail!("document length overflow"),
             };
