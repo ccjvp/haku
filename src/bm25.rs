@@ -9,6 +9,7 @@ use std::{
         Arc,
         atomic::{AtomicU32, AtomicU64, AtomicUsize},
     },
+    time::Instant,
 };
 use tokio::fs;
 
@@ -796,7 +797,7 @@ impl BM25 {
         Ok((branch_ref, new_ref))
     }
 
-    fn get_postings(&self, node_ref: NodeRef) -> anyhow::Result<(NodeRef, u32)> {
+    fn get_node_postings(&self, node_ref: NodeRef) -> anyhow::Result<(NodeRef, u32)> {
         match node_ref.kind {
             NodeKind::Node4 => {
                 let nodes = self.node4.read();
@@ -1455,7 +1456,7 @@ impl BM25 {
 
     // TODO: CAS
     pub async fn add(&self, doc: &str) -> Result<()> {
-        let started_at = std::time::Instant::now();
+        let started_at = Instant::now();
         let doc_id = self.get_doc_id();
         let tokens = tokenize(doc);
 
@@ -1498,7 +1499,7 @@ impl BM25 {
                     }
                     NodeKind::Node4 | NodeKind::Node16 | NodeKind::Node48 | NodeKind::Node256 => {
                         let Some(&key) = bytes.get(pos) else {
-                            let (old_postings, doc_count) = self.get_postings(node_ref)?;
+                            let (old_postings, doc_count) = self.get_node_postings(node_ref)?;
 
                             let (postings, updated_freq) = if old_postings.kind == NodeKind::Empty {
                                 (self.create_postings(doc_id, freq).await?, freq)
@@ -1652,5 +1653,182 @@ impl BM25 {
         self.remove_nodes().await?;
 
         Ok(())
+    }
+
+    fn get_term_header(&self, s: &str) -> Result<Option<TermHeader>> {
+        let b = s.as_bytes();
+        let mut node_ref = self.header.read().term_root;
+
+        let mut pos = 0;
+        loop {
+            match node_ref.kind {
+                NodeKind::TermLeaf => {
+                    let terms = self.terms.read();
+                    let leaf = terms.get(node_ref)?;
+
+                    for i in 0..leaf.count as usize {
+                        let header = self.read_term_header(leaf, i)?;
+                        let start = header.offset as usize;
+                        let end = start + header.len as usize;
+
+                        ensure!(end <= leaf.data.len());
+
+                        let suffix = &leaf.data[start..end];
+                        if *suffix == b[pos..] {
+                            return Ok(Some(header));
+                        }
+                    }
+
+                    unreachable!()
+                }
+                NodeKind::Node4 | NodeKind::Node16 | NodeKind::Node48 | NodeKind::Node256 => {
+                    let (prefix, prefix_len) = self.get_prefix(node_ref)?;
+
+                    if b[pos..].starts_with(&prefix) {
+                        pos += prefix_len;
+                    }
+
+                    let to_child = Edge::new(node_ref, b[pos]);
+
+                    match self.child_for(to_child) {
+                        Ok(Some(child_ref)) => {
+                            node_ref = child_ref;
+                            pos += 1
+                        }
+                        _ => break,
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn idf(&self, token_doc_count: u32) -> f32 {
+        let header = self.header.read();
+        f32::ln(header.doc_count as f32 / token_doc_count as f32)
+    }
+
+    fn tf(
+        &self,
+        freqs: &mut Vec<(u64, u32)>,
+        node_ref: NodeRef,
+        path: [u8; 8],
+        pos: usize,
+    ) -> Result<()> {
+        let prefix_path = |prefix: [u8; 7], prefix_len: u8| -> [u8; 8] {
+            let len = prefix_len as usize;
+            let src = &prefix[0..len];
+
+            let mut dest = path;
+            dest[pos..pos + len].copy_from_slice(&src);
+
+            dest
+        };
+
+        match node_ref.kind {
+            NodeKind::ScalarLeaf => {
+                let freq = self.scalars.read().get(node_ref)?.value;
+                let doc_id = u64::from_be_bytes(path);
+                freqs.push((doc_id, freq));
+            }
+            NodeKind::Node4 => {
+                let n4 = self.node4.read();
+                let node = n4.get(node_ref)?;
+
+                let prefix_path = prefix_path(node.prefix, node.prefix_len);
+                let prefix_pos = pos + node.prefix_len as usize;
+                for i in 0..node.count as usize {
+                    let mut child_path = prefix_path;
+                    child_path[prefix_pos] = node.keys[i];
+
+                    let child_pos = prefix_pos + 1;
+                    self.tf(freqs, node.children[i], child_path, child_pos)?;
+                }
+            }
+            NodeKind::Node16 => {
+                let n16 = self.node16.read();
+                let node = n16.get(node_ref)?;
+
+                let prefix_path = prefix_path(node.prefix, node.prefix_len);
+                let prefix_pos = pos + node.prefix_len as usize;
+                for i in 0..node.count as usize {
+                    let mut child_path = prefix_path;
+                    child_path[prefix_pos] = node.keys[i];
+
+                    let child_pos = prefix_pos + 1;
+                    self.tf(freqs, node.children[i], child_path, child_pos)?;
+                }
+            }
+            NodeKind::Node48 => {
+                let n48 = self.node48.read();
+                let node = n48.get(node_ref)?;
+
+                let prefix_path = prefix_path(node.prefix, node.prefix_len);
+                let prefix_pos = pos + node.prefix_len as usize;
+
+                for key in 0..256 {
+                    let child_index = node.keys[key];
+
+                    if child_index != u8::MAX {
+                        let mut child_path = prefix_path;
+                        child_path[prefix_pos] = key as u8;
+
+                        let child_ref = node.children[child_index as usize];
+                        let child_pos = prefix_pos + 1;
+                        self.tf(freqs, child_ref, child_path, child_pos)?;
+                    }
+                }
+            }
+            NodeKind::Node256 => {
+                let n256 = self.node256.read();
+                let node = n256.get(node_ref)?;
+
+                let prefix_path = prefix_path(node.prefix, node.prefix_len);
+                let prefix_pos = pos + node.prefix_len as usize;
+                for i in 0..256 {
+                    let child_ref = node.children[i];
+                    if child_ref.kind != NodeKind::Empty {
+                        let mut child_path = prefix_path;
+                        child_path[prefix_pos] = node.keys[i];
+
+                        let child_pos = prefix_pos + 1;
+                        self.tf(freqs, child_ref, child_path, child_pos)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    pub fn search(&self, query: &str) -> Result<HashMap<u64, f32>> {
+        let started_at = Instant::now();
+        let tokens = tokenize(query);
+
+        dbg!(query);
+
+        let mut out = HashMap::new();
+        for (token, _) in tokens {
+            let Some(header) = self.get_term_header(&token)? else {
+                continue;
+            };
+
+            let mut tfs = vec![];
+            self.tf(&mut tfs, header.postings, [0u8; 8], 0)?;
+
+            let idf = self.idf(header.doc_count);
+            for (doc_id, tf) in tfs {
+                let tf_idf = tf as f32 * idf;
+                *out.entry(doc_id).or_insert(0.0) += tf_idf;
+            }
+        }
+
+        let elapsed_micros = started_at.elapsed().as_micros();
+        tracing::info!(elapsed_micros, query, "Search");
+
+        Ok(out)
     }
 }

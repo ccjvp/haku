@@ -1,6 +1,7 @@
 use clap::Parser;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use haku::{Args, BM25, IO};
+use iwe_corpus::{doc_key, generate_corpus, hub_key};
 use std::{
     fs::read_to_string,
     hint::black_box,
@@ -10,8 +11,6 @@ use std::{
 };
 use tempfile::tempdir;
 use tokio::runtime::Runtime;
-
-use iwe_corpus::{doc_key, generate_corpus, hub_key};
 
 #[path = "vendor/iwe/corpus.rs"]
 mod iwe_corpus;

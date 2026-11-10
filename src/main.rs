@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
     let bm25 = Arc::new(bm25);
 
     run_index_update(args.clone(), bm25.clone());
-    serve(io.clone(), args.clone()).await
+    serve(io.clone(), args.clone(), bm25.clone()).await
 }
 
 fn setup_tracing() {
