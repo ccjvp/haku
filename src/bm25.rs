@@ -1615,21 +1615,30 @@ impl BM25 {
 
     pub async fn update(&self, args: Arc<Args>) -> Result<()> {
         let _guard = self.update_guard.lock().await;
-        let started_at = Instant::now();
-
         fs::create_dir_all(&args.docs_dir).await?;
 
         let mut entries = fs::read_dir(&args.wal_dir).await?;
-        let mut count = 0;
+        let mut sources = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
-            if count == 0 {
-                tracing::info!("Updating index...");
+            if entry.file_type().await?.is_file() {
+                sources.push(entry.path());
             }
+        }
 
-            let source = entry.path();
-            if !entry.file_type().await?.is_file() {
-                continue;
-            }
+        let total = sources.len();
+        let started = Instant::now();
+        let mut last_info = Instant::now();
+
+        if total > 0 {
+            tracing::info!(total, "Indexing documents");
+        }
+
+        for (index, source) in sources.into_iter().enumerate() {
+            let filename = source
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
 
             let bytes = fs::read(&source).await?;
             let doc = std::str::from_utf8(&bytes)?;
@@ -1637,17 +1646,24 @@ impl BM25 {
             self.add(doc).await?;
             self.remove_nodes().await?;
 
-            let dest = args.docs_dir.join(entry.file_name());
+            let dest = args.docs_dir.join(filename);
             fs::rename(source, dest).await?;
-            count += 1;
+
+            let processed = index + 1;
+            if last_info.elapsed().as_secs() >= 1 || processed == total {
+                tracing::info!(
+                    processed,
+                    total,
+                    percent = processed as f64 / total as f64 * 100.0,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "Documents indexed"
+                );
+
+                last_info = Instant::now();
+            }
         }
 
         self.remove_nodes().await?;
-
-        let elapsed_ms = started_at.elapsed().as_millis();
-        if count > 0 {
-            tracing::info!(elapsed_ms, count, "Index updated");
-        }
 
         Ok(())
     }
