@@ -1201,10 +1201,6 @@ impl BM25 {
                 leaf.data[header_start..header_end].copy_from_slice(header_b);
             }
 
-            if postings != old_postings {
-                self.to_remove.lock().push(old_postings);
-            }
-
             return Ok(true);
         }
 
@@ -1411,7 +1407,6 @@ impl BM25 {
 
         if root != old_root {
             self.header.write().doc_root = root;
-            self.to_remove.lock().push(old_root);
         }
 
         let mut docs = self.scalars.write();
@@ -1456,7 +1451,6 @@ impl BM25 {
 
     // TODO: CAS
     pub async fn add(&self, doc: &str) -> Result<()> {
-        let started_at = Instant::now();
         let doc_id = self.get_doc_id();
         let tokens = tokenize(doc);
 
@@ -1517,9 +1511,6 @@ impl BM25 {
                             };
 
                             self.set_postings(node_ref, postings, doc_count)?;
-                            if old_postings.kind != NodeKind::Empty && postings != old_postings {
-                                self.to_remove.lock().push(old_postings);
-                            }
 
                             break;
                         };
@@ -1567,9 +1558,6 @@ impl BM25 {
             self.to_remove.lock().push(old_root);
         }
 
-        let elapsed_ms = started_at.elapsed().as_millis();
-        tracing::info!(elapsed_ms, "Doc indexed");
-
         Ok(())
     }
 
@@ -1608,7 +1596,6 @@ impl BM25 {
             return Ok(());
         }
 
-        let started_at = std::time::Instant::now();
         while let Some(&node_ref) = to_remove.last() {
             match node_ref.kind {
                 NodeKind::Node4 => self.node4.write().remove(node_ref)?,
@@ -1623,17 +1610,20 @@ impl BM25 {
             to_remove.pop();
         }
 
-        let elapsed_ms = started_at.elapsed().as_millis();
-        tracing::info!(elapsed_ms, "Nodes removed");
-
         Ok(())
     }
 
     pub async fn update(&self, args: Arc<Args>) -> Result<()> {
         let _guard = self.update_guard.lock().await;
-        let mut entries = fs::read_dir(&args.wal_dir).await?;
+        let started_at = Instant::now();
 
+        let mut entries = fs::read_dir(&args.wal_dir).await?;
+        let mut count = 0;
         while let Some(entry) = entries.next_entry().await? {
+            if count == 0 {
+                tracing::info!("Updating index...");
+            }
+
             let source = entry.path();
             if !entry.file_type().await?.is_file() {
                 continue;
@@ -1648,9 +1638,15 @@ impl BM25 {
             let dest = args.data_dir.join(entry.file_name());
             fs::create_dir_all(&args.data_dir).await?;
             fs::rename(source, dest).await?;
+            count += 1;
         }
 
         self.remove_nodes().await?;
+
+        let elapsed_ms = started_at.elapsed().as_millis();
+        if count > 0 {
+            tracing::info!(elapsed_ms, count, "Index updated");
+        }
 
         Ok(())
     }
