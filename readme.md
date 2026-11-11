@@ -2,7 +2,7 @@ Experimental BM25 full-text indexing inspired by DuckDB’s adaptive radix trees
 
 ## Quickstart
 
-Requires Rust, Python 3, and curl.
+Requires Rust, Pyhton 3, and curl.
 
 Start the server:
 
@@ -14,9 +14,6 @@ cargo run --release
 In another terminal, download and index some Wikipedia articles, then run a query:
 
 ```sh
-# Install Python dependencies
-python3 -m pip install datasets
-
 # Download sample data
 python3 scripts/download_wikipedia.py --limit 1000 --output wikipedia.jsonl
 

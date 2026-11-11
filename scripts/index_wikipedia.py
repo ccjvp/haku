@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Post JSONL Wikipedia articles to a running Haku server."""
 
 import argparse
