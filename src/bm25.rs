@@ -1617,6 +1617,8 @@ impl BM25 {
         let _guard = self.update_guard.lock().await;
         let started_at = Instant::now();
 
+        fs::create_dir_all(&args.docs_dir).await?;
+
         let mut entries = fs::read_dir(&args.wal_dir).await?;
         let mut count = 0;
         while let Some(entry) = entries.next_entry().await? {
@@ -1635,8 +1637,7 @@ impl BM25 {
             self.add(doc).await?;
             self.remove_nodes().await?;
 
-            let dest = args.data_dir.join(entry.file_name());
-            fs::create_dir_all(&args.data_dir).await?;
+            let dest = args.docs_dir.join(entry.file_name());
             fs::rename(source, dest).await?;
             count += 1;
         }

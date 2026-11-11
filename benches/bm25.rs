@@ -41,9 +41,9 @@ fn bench(c: &mut Criterion) {
                 for _ in 0..iters {
                     let dir = tempdir().unwrap();
                     let mut args = Args::parse_from(["bm25-bench"]);
-                    args.bm25_path = dir.path().join("bm25");
+                    args.bm25_path = dir.path().join("index/bm25");
                     args.cache_dir = dir.path().join("cache");
-                    args.data_dir = dir.path().join("data");
+                    args.docs_dir = dir.path().join("docs");
                     args.wal_dir = dir.path().join("wal");
                     let io = Arc::new(IO::new(&args));
                     let index = runtime.block_on(BM25::open(io.clone(), &args)).unwrap();

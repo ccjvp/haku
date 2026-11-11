@@ -16,10 +16,10 @@ fn positive_usize(value: &str) -> Result<usize, String> {
 pub struct Args {
     #[arg(long)]
     pub no_cache: bool,
-    #[arg(long, default_value = "data/bm25")]
+    #[arg(long, default_value = "data/index/bm25")]
     pub bm25_path: PathBuf,
-    #[arg(long, default_value = "data")]
-    pub data_dir: PathBuf,
+    #[arg(long, default_value = "data/docs")]
+    pub docs_dir: PathBuf,
     #[arg(long, default_value = "data/wal")]
     pub wal_dir: PathBuf,
     #[arg(long, default_value = "data/cache")]
