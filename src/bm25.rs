@@ -592,8 +592,10 @@ pub struct BM25 {
 
 impl BM25 {
     pub async fn open(io: Arc<IO>, args: &Args) -> Result<Self> {
-        let path = args.bm25_path.to_str().unwrap();
-        let handle = io.get(path).await;
+        args.create_dirs().await?;
+
+        let path = args.index_dir.join("bm25");
+        let handle = io.get(path.to_str().unwrap()).await;
 
         let mut bm25 = Self {
             header: RwLock::new(Header::new(NodeRef::default(), NodeRef::default())),
@@ -620,7 +622,7 @@ impl BM25 {
             }
             Err(_) => {
                 let header = Header::new(term_root, doc_root);
-                io.write(path, bytes_of(&header)).await?;
+                io.write(path.to_str().unwrap(), bytes_of(&header)).await?;
 
                 header
             }
@@ -1615,7 +1617,6 @@ impl BM25 {
 
     pub async fn update(&self, args: Arc<Args>) -> Result<()> {
         let _guard = self.update_guard.lock().await;
-        fs::create_dir_all(&args.docs_dir).await?;
 
         let mut entries = fs::read_dir(&args.wal_dir).await?;
         let mut sources = Vec::new();
@@ -1651,10 +1652,12 @@ impl BM25 {
 
             let processed = index + 1;
             if last_info.elapsed().as_secs() >= 1 || processed == total {
+                let percent = processed as f64 / total as f64 * 100.0;
+
                 tracing::info!(
                     processed,
                     total,
-                    percent = processed as f64 / total as f64 * 100.0,
+                    percent = %format_args!("{:.2}", percent),
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "Documents indexed"
                 );

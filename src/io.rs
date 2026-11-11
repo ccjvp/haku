@@ -427,7 +427,6 @@ impl IO {
     }
 
     async fn write_file_cache(&self, id: u64, b: &[u8]) -> anyhow::Result<()> {
-        fs::create_dir_all(&self.cache_dir).await?;
         fs::write(self.cache_path(id), b).await?;
 
         Ok(())

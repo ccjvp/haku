@@ -41,7 +41,7 @@ fn bench(c: &mut Criterion) {
                 for _ in 0..iters {
                     let dir = tempdir().unwrap();
                     let mut args = Args::parse_from(["bm25-bench"]);
-                    args.bm25_path = dir.path().join("index/bm25");
+                    args.index_dir = dir.path().join("index");
                     args.cache_dir = dir.path().join("cache");
                     args.docs_dir = dir.path().join("docs");
                     args.wal_dir = dir.path().join("wal");

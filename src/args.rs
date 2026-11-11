@@ -11,13 +11,28 @@ fn positive_usize(value: &str) -> Result<usize, String> {
     Ok(value)
 }
 
+impl Args {
+    pub async fn create_dirs(&self) -> anyhow::Result<()> {
+        for dir in [
+            &self.index_dir,
+            &self.docs_dir,
+            &self.wal_dir,
+            &self.cache_dir,
+        ] {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Parser)]
 #[command(about)]
 pub struct Args {
     #[arg(long)]
     pub no_cache: bool,
-    #[arg(long, default_value = "data/index/bm25")]
-    pub bm25_path: PathBuf,
+    #[arg(long, default_value = "data/index")]
+    pub index_dir: PathBuf,
     #[arg(long, default_value = "data/docs")]
     pub docs_dir: PathBuf,
     #[arg(long, default_value = "data/wal")]

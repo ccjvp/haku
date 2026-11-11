@@ -11,6 +11,7 @@ async fn main() -> anyhow::Result<()> {
     setup_tracing();
 
     let args = Arc::new(Args::parse());
+
     let io = Arc::new(IO::new(&args));
     let bm25 = BM25::open(io.clone(), &args).await?;
     let bm25 = Arc::new(bm25);
